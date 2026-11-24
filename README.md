@@ -13,7 +13,7 @@
 │   ├── storage.py   # 草案 SQLite 持久化
 │   └── main.py      # FastAPI 路由
 ├── tests/
-│   └── test_app.py  # 26 个单元/端到端测试
+│   └── test_app.py  # 31 个单元/端到端/局部搜索专项测试
 ├── demo/
 │   ├── make_demo_data.py   # 生成演示 PNG
 │   ├── demo_requests.sh    # 可直接运行的 curl 演示
@@ -91,10 +91,43 @@ multipart 表单：`reference`（PNG）、`fragment`（PNG）、`unit_w`、`unit
 1. **CP-SAT 精确优化（短预算）**：结构简单/约束多时直接证最优。
 2. **CP-SAT 纯可行性**：颜色整数变量 + 每位置一条 `add_allowed_assignments`
    四元组允许表（≤256 行），最坏尺寸通常 0.1 秒内判定可行性或严格证无解。
-3. **局部搜索**：在可行网格上单格变色爬山 + 随机重启，增量评估只看受影响的
-   4 个图块，用满剩余预算冲最高分；达到「格数 × 最高频次」理论上界即声明最优。
+3. **局部搜索（合法邻域爬山 + 多样化合法随机重启）**：
+   - 邻域移动：**单格改色**（增量评估 4 个图块）、**整列/整行联动改色**、
+     **2×2 图块联动改色**。当单格改色全部违反图块规则（典型如同列同色
+     竖条纹图块系统）时，仍可靠联动移动继续提分；
+   - 随机重启：每个起点由「随机赋值 + 最小冲突修复」构造成**彼此不同的
+     合法网格**（完好色点始终保留），按网格签名去重，并与「在当前最佳
+     候选上扰动后修复」的起点交替使用；
+   - 重启失败或预算用尽时，返回整个搜索过程找到的**最高分合法候选**
+     （至少为 CP-SAT 给出的初始可行网格）；达到「格数 × 最高频次」
+     理论上界即声明最优，否则仅为 `feasible`。
 
 无 OR-Tools 时自动退回内置的行编码回溯 + 分支定界（带递归剪枝与时限检查）。
+
+## API 请求示例
+
+```bash
+# 健康检查
+curl http://127.0.0.1:8000/health
+
+# 创建草案（参考图 + 残片图 + 重复单元尺寸）
+curl -X POST http://127.0.0.1:8000/api/drafts \
+  -F "reference=@demo/reference_stripes.png;type=image/png" \
+  -F "fragment=@demo/fragment_stripes.png;type=image/png" \
+  -F "unit_w=6" -F "unit_h=6"
+
+# 在缺损处补录完好色点（格坐标）
+curl -X POST http://127.0.0.1:8000/api/drafts/1/points \
+  -F "cell_x=4" -F "cell_y=4" -F "color=220,60,60"
+
+# 查看草案（状态、色点、候选网格、图块使用情况）
+curl http://127.0.0.1:8000/api/drafts/1
+
+# 领取正式纹版 PNG（仅 optimal 放行；feasible 返回 409 not_optimal）
+curl -OJ "http://127.0.0.1:8000/api/drafts/1/pattern.png?scale=8"
+```
+
+完整可运行脚本见 `demo/demo_requests.sh`。
 
 ## 测试
 

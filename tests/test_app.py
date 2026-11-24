@@ -236,6 +236,165 @@ def test_backtrack_matches_cpsat_on_small_case():
 
 
 # --------------------------------------------------------------------------- #
+# 局部搜索：随机重启 + 联动改色（同列同色竖条纹图块系统）
+# --------------------------------------------------------------------------- #
+
+def _uneven_stripes_case():
+    """列序列 RRRRRBBB 的 8×8 竖条纹参考：两种图块频次不等。
+
+    RR/RR 图块 32 次、BB/BB 16 次、RB/RB 与 BR/BR 各 8 次。
+    该图块系统里任何同列同色合法网格的单格变色都会破坏图块，
+    只能靠整列/整行联动改色移动。
+    """
+    col_seq = [RED, RED, RED, RED, RED, BLUE, BLUE, BLUE]
+    ref_grid = [[col_seq[x] for x in range(8)] for _ in range(8)]
+    ref = images.parse_reference(png_bytes(ref_grid))
+    color_index = {c: i for i, c in enumerate(ref.colors)}
+    quad_colors = sorted(
+        tuple(color_index[c] for c in key) for key in ref.tile_counts)
+    quad_freq = {
+        q: ref.tile_counts[next(
+            k for k in ref.tile_counts
+            if tuple(color_index[c] for c in k) == q)]
+        for q in quad_colors}
+    return ref, quad_colors, quad_freq, color_index
+
+
+def _all_quads_legal(ref, grid, w, h):
+    keys = set(ref.tile_counts)
+    for y in range(h):
+        for x in range(w):
+            key = (
+                grid[y][x],
+                grid[y][(x + 1) % w],
+                grid[(y + 1) % h][x],
+                grid[(y + 1) % h][(x + 1) % w],
+            )
+            if key not in keys:
+                return False
+    return True
+
+
+def test_local_search_single_cell_moves_all_illegal():
+    """同列同色竖条纹：单格改色没有任何合法走法（联动改色的前提场景）。"""
+    ref, quad_colors, quad_freq, ci = _uneven_stripes_case()
+    ri, bi = ci[RED], ci[BLUE]
+    w = h = 6
+    start = [[ri, bi, ri, bi, ri, bi] for _ in range(h)]
+    valid = set(quad_colors)
+
+    def quad_at(g, x, y):
+        return (g[y][x], g[y][(x + 1) % w], g[(y + 1) % h][x],
+                g[(y + 1) % h][(x + 1) % w])
+
+    n_legal = 0
+    for y in range(h):
+        for x in range(w):
+            old = start[y][x]
+            for value in range(len(ref.colors)):
+                if value == old:
+                    continue
+                g = [row[:] for row in start]
+                g[y][x] = value
+                affected = {((x - dx) % w, (y - dy) % h)
+                            for dx in (0, 1) for dy in (0, 1)}
+                if all(quad_at(g, ax, ay) in valid for ax, ay in affected):
+                    n_legal += 1
+    assert n_legal == 0
+
+
+def test_local_search_coordinated_recolor_escapes_dead_end():
+    """单格改色全非法时，联动改色从合法低分起点提到约束下最高分。"""
+    import time as _time
+
+    ref, quad_colors, quad_freq, ci = _uneven_stripes_case()
+    ri, bi = ci[RED], ci[BLUE]
+    w = h = 6
+    start = [[ri, bi, ri, bi, ri, bi] for _ in range(h)]
+    # 锁定一红列、一蓝列；蓝列不可改色，约束下最优为 5 红列 1 蓝列 = 864
+    fixed = {(0, 0): ri, (1, 0): bi}
+    stats: dict = {}
+    best, best_score = solver._local_search(
+        [row[:] for row in start], quad_colors, quad_freq, ref.colors,
+        w, h, fixed, _time.perf_counter() + 2.5, stats)
+
+    # 重启起点彼此不同、全部合法且保留固定色点
+    signatures = stats["start_signatures"]
+    assert len(signatures) >= 3
+    assert len(set(signatures)) == len(signatures)
+    for sig in signatures:
+        g = [list(sig[y * w:(y + 1) * w]) for y in range(h)]
+        rgb_g = tuple(tuple(ref.colors[v] for v in row) for row in g)
+        assert _all_quads_legal(ref, rgb_g, w, h)
+        for (x, y), color in fixed.items():
+            assert g[y][x] == color
+
+    # 最终候选严格提分、合法、色点保留，到达约束下最优 864
+    assert best_score > 288
+    assert best_score == 864
+    rgb_best = tuple(tuple(ref.colors[v] for v in row) for row in best)
+    assert _all_quads_legal(ref, rgb_best, w, h)
+    for (x, y), color in fixed.items():
+        assert best[y][x] == color
+
+
+def test_local_search_reaches_upper_bound_without_fixed_points():
+    """无固定点时联动改色 + 重启可达到频次理论上界，solve 标为已证最优。"""
+    import time as _time
+
+    ref, quad_colors, quad_freq, ci = _uneven_stripes_case()
+    ri, bi = ci[RED], ci[BLUE]
+    w = h = 6
+    start = [[ri, bi, ri, bi, ri, bi] for _ in range(h)]
+    upper = w * h * max(quad_freq.values())
+    best, best_score = solver._local_search(
+        [row[:] for row in start], quad_colors, quad_freq, ref.colors,
+        w, h, {}, _time.perf_counter() + 2.5)
+    assert best_score == upper
+    rgb_best = tuple(tuple(ref.colors[v] for v in row) for row in best)
+    assert _all_quads_legal(ref, rgb_best, w, h)
+
+    result = solver.solve(ref.colors, ref.tile_counts, w, h, {}, 5.0)
+    assert result.status == solver.STATUS_OPTIMAL
+    assert result.score == upper
+    assert _all_quads_legal(ref, result.grid, w, h)
+
+
+def test_local_search_keeps_best_legal_candidate_when_budget_runs_out():
+    """预算立即用尽：仍返回不低于初始分的合法候选，色点不被破坏。"""
+    import time as _time
+
+    ref, quad_colors, quad_freq, ci = _uneven_stripes_case()
+    ri, bi = ci[RED], ci[BLUE]
+    w = h = 6
+    start = [[ri, bi, ri, bi, ri, bi] for _ in range(h)]
+    fixed = {(0, 0): ri, (1, 0): bi}
+    best, best_score = solver._local_search(
+        [row[:] for row in start], quad_colors, quad_freq, ref.colors,
+        w, h, fixed, _time.perf_counter() + 1e-6)
+    rgb_best = tuple(tuple(ref.colors[v] for v in row) for row in best)
+    assert _all_quads_legal(ref, rgb_best, w, h)
+    assert best_score >= 288
+    for (x, y), color in fixed.items():
+        assert best[y][x] == color
+
+
+def test_local_search_fully_fixed_grid_unchanged():
+    """全部格固定时无移动空间，原样返回合法网格。"""
+    ref, quad_colors, quad_freq, ci = _uneven_stripes_case()
+    ri, bi = ci[RED], ci[BLUE]
+    w = h = 6
+    start = [[ri, bi, ri, bi, ri, bi] for _ in range(h)]
+    full_fixed = {(x, y): start[y][x] for y in range(h) for x in range(w)}
+    import time as _time
+    best, best_score = solver._local_search(
+        [row[:] for row in start], quad_colors, quad_freq, ref.colors,
+        w, h, full_fixed, _time.perf_counter() + 1.0)
+    assert best == start
+    assert best_score == 288
+
+
+# --------------------------------------------------------------------------- #
 # API 端到端
 # --------------------------------------------------------------------------- #
 
